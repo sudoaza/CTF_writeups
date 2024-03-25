@@ -179,4 +179,4 @@ The next blockchain challenge was Crypto Casino, I wasted all my time trying to 
 reentrancy bug on withdraw that never worked and totally ignored the boring and evidently deterministic
 `_randomNumber` function. 
 
-It was great to finally get my hand disty with solidity and getting to know the tools.
+It was great to finally get my hands dirty with solidity and getting to know the tools.
