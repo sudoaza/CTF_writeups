@@ -1,67 +1,184 @@
 # Mid
 
-**Flag:** `TFCCTF{w3_l0v3_a_g0od_b1nary_se4rch}`
+`Mid` (474 pts, 4 solves) is a crypto game-oracle challenge ("Mid means middle,
+right?"). The remote holds a random 30-character password over
+`[0-9A-Za-z]` and answers up to 220 lexicographic comparisons — but a hidden
+`mood` bit flips once, after which one of the two query "states" starts lying.
+Key idea: detect the flip with cheap canary probes, then roll the binary search
+back to a checkpoint and finish on the truthful state.
 
-# Mid — running log
+## Recon
 
-Append-only. Timestamp every entry.
+The attachment is `chall.py`, the full service source:
 
-## Hypotheses
-- [10:30] H1-H4 as in brief.md: 62-ary lexicographic binary search + oracle-flip detection.
-## Findings
-- [10:30] Source recovered and read: exact semantics confirmed (195 queries, 30 chars, mood flips once at switch_at).
-- [10:30] local flag placeholder is TFCCTF{no1_s0_3asy} (only the remote env flag counts).
-## Dead ends
-- (none)
-## Limitations
-- Remote connection endpoint not yet started/known (dynamic netcat challenge; needs the platform to assign host:port).
-## Next actions
-- Start the dynamic instance to get host:port.
-- Write and test the solver locally against chall.py, then run against the remote.
+```python
+MAX_QUERIES = 195
+PASSWORD_LENGTH = 30
+ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase  # 62
 
-## Brief / category / skills / hypotheses
-MISC/GAME — 175 pts — dynamic netcat — ~87 solves.
-- Brief: 'Mid means middle, right?' Source at files/chall.py: ~195 queries, 30-char password over [0-9A-Za-z], a 'mood' flips once at switch_at.
-- Required skills: pwntools remote I/O; strategy/optimization (information-theoretic guessing with flip detection).
-- First hypotheses: mastermind-style oracle (higher/lower or proximity to 'mid'); detect the flip point, then binary search the alphabet; reconnect for fresh instances.
+password = generate_password()
+switch_at = secrets.randbelow(MAX_QUERIES + 1)
+mood = 0
+for query_id in range(MAX_QUERIES):
+    if query_id == switch_at: mood = 1
+    line = input("> ").strip()
+    state_raw, guess = line.split(maxsplit=1)
+    state = int(state_raw)              # 0 or 1
+    truth = real_answer(guess, password)   # "smaller"/"larger"/"equal"
+    if state == mood:
+        print(truth)
+        if truth == "equal": print(FLAG); return
+    else:
+        print(secrets.choice(("smaller", "larger")))
+```
 
+Connecting to the real instance shows a crucial discrepancy — the deployed
+`mid2` image allows more queries than the stale attached source:
 
-## 2026-09-05 16:31 UTC — solver-design session (paused by coordinator)
-### Findings
-- Re-verified oracle semantics against files/chall.py (195 queries, 30 chars, mood flips once at switch_at in 0..195).
-- Info budget: password entropy = 30*log2(62) = 178.63 bits; worst-case search = 178 comparisons + 1 final "equal" query = 179 truthful queries; avg ~177.7. Only ~16 spare queries for flip detection.
-- Naive state-0 global binary search wins iff F >= ~180: measured 6.4-8% (matches parent's 8-16% for naive).
-- Canary-every-K + checkpoint rollback CANNOT fit: overhead ~ 179/K + K >= 26.8 > 16, so it always exceeds 195 queries. Confirmed by simulation (with query limit enforced, max ~7%).
-- Weighted Renyi-Ulam search (tolerating e lies) implemented and verified correct on small N; 0-lie cost ~182 (e=1) / ~186 (e=2) queries vs 177.7 plain. But it does NOT detect the flip early: random answers decay the <=e candidate set only like (k+1)/2^k, so "candidate set empty" fires far too late (~192 queries).
-- Fixed two-phase state schedule gives >=179 truthful bits only for F in a 33-wide window => ~17% theoretical ceiling; joint (P,F) decoding would be needed to exploit it.
-- Joint entropy of (password, flip) is ~186.2 bits < 195, so an optimal joint scheme exists, but a practical one was not found.
-### Dead ends
-- Canary/rollback strategies (all K, rollback depths, canary styles): budget-infeasible.
-- Renyi-Ulam "detect flip via empty candidate set": too slow.
-- Multi-hypothesis F-tracker (midpoint+canary policy): ~1% (policy ineffective).
-### Limitations
-- Did not reach a solver with credible success rate; paused before remote run. No dynamic instance was started (respecting 3-slot limit).
-### Artifacts
-- solve/mid_solver.py: exact Oracle simulator + naive solver + WeightedSearchE + remote I/O skeleton.
-- solve/solver_experiments.py: notes.
-### Next (if revisited)
-- Find a practical JOINT (P, F) decoding scheme (adaptive state via multi-hypothesis tracking with a better query policy) targeting ~186 bits in 195 queries.
-- Or implement the ~17% two-phase joint decoder and retry over fresh reconnects (~6 attempts => ~67%).
+```
+$ openssl s_client -connect <deployment>.challs.ctf.thefewchosen.com:1337 -quiet
+Find the secret.
+length = 30
+queries = 220
+>
+```
 
+## Analysis
 
-## 2026-09-05 23:15 UTC — SOLVED
-### Findings
-- Remote (mid2 image) uses MAX_QUERIES = 220, NOT 195 as in the attached source.
-  Banner: "length = 30", "queries = 220". The provided chall.py (195) is stale.
-- Remote transport: TLS to <deployment>.challs.ctf.thefewchosen.com:1337, PTY echo
-  (each input line is echoed), CRLF line endings, "> " prompt after every answer.
-- Winning solver: checkpoint+rollback binary search (state 0) with 30 decreasing-gap
-  change-point probes [8,17,...,219]. Probe = guess "0"*30 on state 0; "larger" =>
-  mood flipped => switch to state 1 and roll back to the widest checkpoint still
-  searchable in the remaining budget (size <= 2^R), then finish on state 1.
-- Local success rate ~93.2% (30000 trials); remote solved on attempt 1.
-### Flag
-- TFCCTF{w3_l0v3_a_g0od_b1nary_se4rch} (submitted, ok:true)
-### Dead ends / limitations
-- For the ORIGINAL 195-query source, this class of strategy caps ~40% (tight info
-  budget); the remote being 220 queries is what makes ~93% achievable.
+Observation: each query is `<state> <guess>`. When `state == mood` the answer is
+the true lexicographic comparison (`smaller`/`larger`/`equal`, with `equal`
+printing the flag); when `state != mood` the answer is a random
+`smaller`/`larger`. `mood` starts at 0 and flips to 1 exactly once at
+`switch_at`, so the "truthful state" is 0 before the flip and 1 after it.
+
+The password has `30 * log2(62) ≈ 178.6` bits, so a plain binary search needs
+about 179 truthful comparisons — tight against 195, but comfortable against the
+remote's 220, leaving ~40 spare queries to handle the flip.
+
+The detection primitive: guess `"0"*30` on **state 0**. While state 0 is
+truthful, `"0"*30 < password` always (the password is essentially never all
+zeros), so the truthful answer is always `smaller`. A `larger` on this probe is
+therefore impossible truthfully — it can only come from the random (lying) state,
+i.e. the flip has happened. Each probe catches the flip with probability ~1/2,
+so a decreasing-gap probe schedule (sparse early, dense late) detects it quickly
+and cheaply.
+
+Because the flip also corrupts the running binary-search interval, the solver
+keeps a checkpoint after every midpoint query and, on detection, rolls back to
+the widest checkpoint still searchable in the remaining budget, then finishes on
+state 1. The technique is **change-point detection + checkpoint rollback** (a
+single-sided liar search).
+
+## Exploit
+
+1. **Map integers to 30-char base-62 strings** (most-significant digit first)
+   and back:
+
+   ```python
+   ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase
+   A = len(ALPHABET)   # 62
+   L = 30
+   N = A ** L
+
+   def i2s(v):
+       out = []
+       for _ in range(L):
+           out.append(ALPHABET[v % A]); v //= A
+       return "".join(reversed(out))
+   ```
+
+2. **Binary search on state 0, interleaved with canary probes.** The probe
+   schedule is 30 indices with a decreasing gap, the last at 219:
+
+   ```python
+   PROBES = [8,17,26,35,44,53,62,71,79,87,95,103,111,119,127,
+             134,141,148,155,162,169,175,181,187,193,199,204,209,214,219]
+   ```
+
+   At a probe index, query `(0, i2s(0))`; `larger` means the flip happened:
+
+   ```python
+   def solve_session(query):
+       lo, hi = 0, N - 1
+       checkpoints = []
+       i, detected, pset = 0, False, set(PROBES)
+       while i < 220:
+           if i in pset:
+               y = query(0, i2s(0)); i += 1
+               if y == "equal": return True
+               if y is None: return False
+               if y == "larger": detected = True; break
+           else:
+               g = (lo + hi) // 2
+               y = query(0, i2s(g)); i += 1
+               if y == "equal": return True
+               if y is None: return False
+               if y == "smaller": lo = g + 1
+               else: hi = g - 1
+               checkpoints.append((lo, hi))
+       if not detected: return False
+       # roll back to the widest checkpoint still searchable in R queries
+       R = 220 - i
+       for cl, ch in checkpoints:
+           if ch - cl + 1 <= (1 << R):
+               lo, hi = cl, ch; break
+       else:
+           return False
+   ```
+
+3. **Finish the search on state 1** (now the truthful state):
+
+   ```python
+       while i < 220:
+           if lo > hi: return False
+           if lo == hi: return query(1, i2s(lo)) == "equal"
+           g = (lo + hi) // 2
+           y = query(1, i2s(g)); i += 1
+           if y == "equal": return True
+           if y is None: return False
+           if y == "smaller": lo = g + 1
+           else: hi = g - 1
+       return False
+   ```
+
+4. **Handle the remote transport.** It is TLS on port 1337 behind a PTY that
+   echoes every input line and prints a `> ` prompt after each answer, so the
+   reader must skip the echo and consume the prompt:
+
+   ```python
+   def query(self, state, guess_str):
+       sent = f"{state} {guess_str}"
+       self.s.sendall((sent + "\n").encode())
+       while True:
+           line = self._readline()
+           if line == sent: continue        # PTY echo
+           if line == "equal":
+               self.flag = self._readline(); return "equal"
+           if line in ("smaller", "larger"):
+               self._read_exact(2)          # "> " prompt
+               return line
+           if line in ("out of queries", "usage", "invalid"): return None
+   ```
+
+5. **Run it.** Local simulation measures ~93.2% success (30000 trials); the
+   remote was solved on attempt 1.
+
+## Full chain
+
+```
+python3 solve/final220.py --host <deployment>.challs.ctf.thefewchosen.com --attempts 40
+```
+
+## Flag
+
+`TFCCTF{w3_l0v3_a_g0od_b1nary_se4rch}`
+
+## Lessons
+
+- Always read the live banner: the deployed service allowed 220 queries while
+  the attached source said 195 — that extra budget is what made the ~93% solve
+  feasible (the 195-query version caps this strategy around 40%).
+- A single monotone state flip in a comparison oracle can be handled by cheap
+  canary probes plus checkpoint rollback; you do not need full joint decoding.
+- On PTY-backed services, remember every line you send is echoed and every
+  answer is followed by a prompt — parse those explicitly.

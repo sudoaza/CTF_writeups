@@ -1,114 +1,239 @@
 # Cadence
 
-**Flag:** `TFCCTF{the_encore_resonates_over_gf2_7c4e91ab}`
+`Cadence` (500 pts, 1 solve) is a reversing + remote challenge ("Winamp who?")
+shipping a static Zig 0.16 ELF: a music player with a hidden "Encore" stage. The
+remote runs it with the flag in the environment and prints the flag only when
+you feed it a WAV whose samples make an internal PRF hit a target state. Key
+idea: the whole sample-to-state map is **linear over GF(2)**, so the "music" is
+a 256-bit linear system to solve.
 
-# Cadence — running log
+## Recon
 
-Append-only. Timestamp every entry.
+```
+$ file cadence
+cadence: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, with debug_info, not stripped
 
-## Hypotheses
-## Findings
-## Dead ends
-## Limitations
-## Next actions
+$ strings -a cadence | grep -iE 'EXTENC|SESSION|PERFECT|resonat|Encore'
+PERFECT CADENCE - the track resonates
+Encore
+SESSION
+ADD ENCORE TRACK
+#EXTENC:
+cadence/encore/session/v2
+Wrong sample rate for this session.
+Add a track whose waveform resonates with this session.
+This stage carries no flag - the encore only pays out on the remote.
+Too few samples to resonate.
+```
 
+The binary has DWARF debug info (Zig symbols intact), which makes the reverse
+fast. The hidden Encore stage is enabled by feeding an `.m3u` file containing
+the line `#EXTENC:<32 hex seed>`.
 
-## [2026-09-05T14:19:15Z] Recon & algorithm recovered
-- Binary: Zig 0.16 static ELF, DWARF debug info. Music player "cadence" with hidden "Encore" stage.
-- Encore enabled by passing an .m3u file containing line `#EXTENC:<32 hex seed>`.
-- Remote service runs cadence with FLAG env; Encore success prints flag.
-- TUI Encore screen shows SESSION = hex(SHA256("cadence/encore/session/v2" || seed)[0:16]) and required sample rate = [8000,11025,16000,22050,32000,44100][nonce[0]%6].
-- Submission: paste unpadded base64 WAV (mono 16-bit PCM, exact rate, >15 samples); binary rejects '=' padding.
-- Reversed `encore.resonates`: SHA-256 PRF init/target, GF(2^32) gfmul (poly 0x4c11db7), splitmix64 counter, 4-lane update.
-- Whole sample->final-state map is GF(2)-linear; solving linear system gives valid WAV (n=28 works in Python sim).
-- Local binary uses SHA-NI (host lacks it); running under `qemu-x86_64 -cpu max` works as oracle.
-- Dead end: local TUI prompt prepends the view-switch '9' key to submitted base64 input (input becomes '9'+b64), breaking decoding. Need workaround (use tab to reach Encore, or account for extra char).
-## Next actions
-- Fix TUI input workaround; validate solver locally under qemu.
-- Start remote instance when slot free, solve, submit flag.
+## Analysis
 
-## [2026-09-05T16:26Z] Solver complete; remote protocol recovered; paused by coordinator
+Observation: Encore shows a session id and a required sample rate, then asks for
+base64 WAV data (mono 16-bit PCM at the exact rate, more than 15 samples). On
+success it prints `PERFECT CADENCE - the track resonates` — and, only on the
+remote, the flag.
 
-### SOLVER (offline, validated)
-- `solver.py` in this folder: `solve(nonce_hex, n=28)` -> (b64, rate, samples).
-- Local validation under qemu: pasting the b64 into the Encore prompt yields
-  "PERFECT CADENCE - the track resonates" (flag only prints on remote).
-- Key constants in solver.py (GC0/GC1/GC2/GFINAL/POLY/CINV/C_words/RATES).
-- rate = RATES[nonce[0] % 6]; nonce = SHA256("cadence/encore/session/v2" || seed)[0:16].
+The session and rate come from the seed:
 
-### REMOTE SERVICE PROTOCOL (verified once, instance affd659eb99e3328)
-1. TLS connect to <name>.challs.ctf.thefewchosen.com:1337 (no verify).
-2. The service runs a pty in canonical+echo mode. It reads LINES and ignores any
-   line that is not exactly 32 hex chars.
-3. Send the 32-hex SEED line + CR. The wrapper echoes it, then launches the
-   cadence TUI with that seed (writes an #EXTENC m3u). Observed bytes after seed:
-   `<seed>\r\n` + `\x1b[?1049h\x1b[?25l`.
-4. With a seed m3u, cadence opens DIRECTLY on the Encore view (verified locally):
-   SESSION <32hex>, rate, prompt `> ` waiting for base64. NO tab navigation needed.
-5. Paste the base64 (standard padded b64, 136 chars for n=28) then Enter.
-6. Screen shows "PERFECT CADENCE - the track resonates"; remote prints the FLAG
-   (locally prints "This stage carries no flag - the encore only pays out on the remote.").
+```
+nonce = SHA256("cadence/encore/session/v2" || seed)[0:16]
+SESSION = hex(nonce)
+rate = [8000, 11025, 16000, 22050, 32000, 44100][nonce[0] % 6]
+```
 
-### SINGLE-SHOT RUN STEPS (do exactly this on a fresh live instance)
-- `python3 solver.py` is not a CLI; import it. Steps in remote_solve2.py:
-  1. connect TLS (setblocking False).
-  2. sendall(seed.encode()+b'\r').
-  3. feed output into pyte.Screen(100,30); WAIT until raw stream contains
-     b'\x1b[?1049h' (TUI up) or screen shows SESSION. Be patient (>=15s).
-  4. Only AFTER TUI confirmed: sendall(b64.encode()); sleep 0.4; feed 1s; sendall(b'\r').
-  5. feed 6s; read screen; regex TFCCTF{...}.
-- CRITICAL: do NOT send tabs/Enter/base64 before the TUI is up. The wrapper is
-  still canonical while it processes the seed; any early input is echoed and
-  eaten by the line reader (this broke the 63ca attempt: base64 was echoed back).
+Reversing `encore.resonates` shows it is a custom PRF:
 
-### INFRA FLAKINESS (why paused)
-- Dynamic-instance pods are unreliable. Only ~3 of ~8 cadence starts came up
-  (echo on 8d3ec0c1d8858055, affd659eb99e3328, 63ca5354bb60cff2). The rest never
-  echoed (pod not ready / dead) even after 5-15 min.
-- On affd, after seed we saw only 48 bytes = seed echo + 1049h+25l; the full
-  TUI render did not arrive in a 3-4s window, so either the render is delayed
-  (blocking mpv/audio init?) or cadence dies inside ui.run on the remote.
-  NOT the terminal-size issue (verified locally 0x0/24x80/30x100 all render).
-- Hypothesis to test next: wait much longer (20-30s) for the render after 1049h.
-- Slot pressure from siblings; coordinator suspended re-arming.
+- SHA-256 domain-separated `init` and `target` (8 x 32-bit words),
+- a GF(2^32) multiply with polynomial `0x4c11db7`,
+- a `splitmix64` counter, and a 4-lane per-sample update.
 
-### FILES
-- solver.py, remote_solve2.py, diag.py (raw-byte capture) in this folder.
+Hypothesis: `resonates(nonce, rate, samples)` is GF(2)-linear in the sample
+bits. Confirmation: modeling it as a linear map and solving the linear system
+yields samples that land exactly on the target state. The technique is a
+**GF(2) linear solve of a hash/PRF** — each sample is 16 bits, so n samples give
+16n unknowns against a 256-bit target state; n = 48 gives full rank 256.
 
-## [2026-09-05T20:25Z] 5-for-5 dead pods post-restart -> infra escalated
-- Challenge-manager restarted 19:18:26Z (process_start_time_seconds 1788635906).
-- Retried 5 fresh pods per coordinator policy (probe :1337 echo, 25s-4min each):
-  43649b5c, da8021e2, 1d1b07f6, 9c26f049, c0d24d71 -> ALL 0 bytes (TLS terminates,
-  no canonical echo, no 1049h, seed line also gets nothing).
-- Pre-restart pods were ~40% live (echo + TUI init); post-restart 0/8 live.
-- Conclusion: cadence pod startup is broken after the CM restart (image pull,
-  entrypoint, or Traefik backend health), not random flakiness.
-- Solver + single-shot run steps still ready (solver.py, auto_solve.py, diag.py).
-- Slot freed (stopped last pod); only larpin running.
+Dead ends: the local TUI prepends a stray `9` view-switch key to pasted input,
+and the local binary uses SHA-NI instructions the host CPU lacks (worked around
+by running under `qemu-x86_64 -cpu max` as an oracle). Neither matters for the
+remote, which starts directly on the Encore view.
 
-## [2026-09-06T00:33Z] SOLVED
-FLAG: TFCCTF{the_encore_resonates_over_gf2_7c4e91ab}
+## Exploit
 
-### Root cause of my earlier "dead pod" reads
-- Python non-blocking ssl recv() raises ssl.SSLWantReadError, which is NOT a
-  BlockingIOError; my `except BlockingIOError`/`except Exception: break` loop
-  aborted on the FIRST empty recv, so live pods looked dead.
-- Fix: use blocking socket with settimeout(0.5) and catch socket.timeout to keep
-  reading. openssl s_client confirmed the pod was alive all along.
+1. **Implement the PRF.** The essential pieces are `gfmul`, `splitmix64`, and
+   the 4-lane update (from the reversed `encore.resonates`):
 
-### Actual remote protocol (corrected)
-- The service ignores the sent 32-hex line's CONTENT: it generates a FRESH
-  RANDOM seed per connection. Do NOT compute from your own seed.
-- Read SESSION (32 hex) and rate from the rendered Encore screen, then solve for
-  nonce = bytes.fromhex(SESSION). rate = RATES[nonce[0] % 6] (confirmed).
-- n=28/32/40 are NOT reliably surjective over GF(2)^256 for all nonces (rank can
-  be 255). Use n=48 (rank 256 across tested nonces; b64 = 188 chars, accepted).
+   ```python
+   MASK32 = 0xffffffff
+   MASK64 = 0xffffffffffffffff
+   GOLD64 = 0x9e3779b97f4a7c15
+   BASE64 = 0xc0dace5551a7e001
+   GC0 = 0x9e3779b1; GC1 = 0x85ebca77; GC2 = 0xc2b2ae3d
+   POLY = 0x104c11db7
+   CINV = 0x9a7ed247
+   C_words = [0x452821e6,0x38d01377,0xbe5466cf,0x34e90c6c,0xc0ac29b7,0xc97c50dd,0x3f84d5b5,0xb5470917]
+   RATES = [8000,11025,16000,22050,32000,44100]
 
-### Single-shot solve (working)
-1. TLS connect :1337 (blocking, timeout 0.5).
-2. send any 32-hex line + CR.
-3. read ~12s into pyte.Screen(100,30); wait for 1049h.
-4. regex SESSION ([0-9a-f]{32}) and at (\d+) Hz from screen.
-5. b64,rate,samples = solve(SESSION)  # n=48
-6. send b64, sleep 0.4, send CR, read 10s.
-7. flag regex [A-Za-z0-9_]{2,30}{...} on raw text (strip leading junk from render).
+   def gfmul(a, b):
+       res = 0
+       for _ in range(32):
+           if b & 1: res ^= a
+           b >>= 1
+           a = (a << 1) & MASK32
+           if a & 0x100000000: a ^= POLY
+       return res & MASK32
+
+   def splitmix64(z):
+       z = ((z ^ (z >> 30)) * 0xbf58476d1ce4e5b9) & MASK64
+       z = ((z ^ (z >> 27)) * 0x94d049bb133111eb) & MASK64
+       return (z ^ (z >> 31)) & MASK64
+
+   def prf(domain, nonce, rate=None):
+       msg = domain + nonce + (b'' if rate is None else struct.pack('<I', rate))
+       return hashlib.sha256(msg).digest()
+
+   def words(d): return [int.from_bytes(d[i:i+4], 'little') for i in range(0, len(d), 4)]
+
+   def init_state(nonce, rate): return words(prf(b'cadence/resonance/init/v2', nonce, rate))
+
+   def target_state(nonce):
+       T = words(prf(b'cadence/resonance/target/v2', nonce))
+       nw = words(nonce)
+       g = [0]*8
+       g[5] = nw[0]^T[0]^C_words[0]; g[2] = nw[1]^T[1]^C_words[1]
+       g[7] = nw[2]^T[2]^C_words[2]; g[0] = nw[3]^T[3]^C_words[3]
+       g[3] = nw[0]^T[4]^C_words[4]; g[6] = nw[1]^T[5]^C_words[5]
+       g[1] = nw[2]^T[6]^C_words[6]; g[4] = nw[3]^T[7]^C_words[7]
+       return [gfmul(g[i], CINV) for i in range(8)]
+   ```
+
+2. **Model the per-sample update** (the full `resonates` from `solver.py`).
+   Because every operation is XOR/shift/GF-multiply, the final state is linear
+   in the sample bits. Build the linear system: for each sample `i` and each bit
+   `b`, compute the delta from the all-zero input, and solve for the combination
+   that equals `target_state`:
+
+   ```python
+   def pack(S): return sum(w << (32*i) for i, w in enumerate(S)) & ((1<<256)-1)
+
+   def solve_wav(nonce, rate, n=48):
+       c0 = pack(resonates(nonce, rate, [0]*n))
+       cols = []
+       for i in range(n):
+           for b in range(16):
+               s = [0]*n; s[i] = 1 << b
+               cols.append(pack(resonates(nonce, rate, s)) ^ c0)
+       rhs = pack(target_state(nonce)) ^ c0
+       basis = {}
+       for j, col in enumerate(cols):
+           val, var = col, 1 << j
+           while val:
+               p = val.bit_length() - 1
+               if p in basis: val ^= basis[p][0]; var ^= basis[p][1]
+               else: basis[p] = (val, var); break
+       r, sol = rhs, 0
+       for p in sorted(basis, reverse=True):
+           if (r >> p) & 1: r ^= basis[p][0]; sol ^= basis[p][1]
+       assert r == 0
+       samples = []
+       for i in range(n):
+           x = 0
+           for b in range(16):
+               if (sol >> (i*16+b)) & 1: x |= 1 << b
+           samples.append(x)
+       assert resonates(nonce, rate, samples) == target_state(nonce)
+       return samples
+   ```
+
+   n = 48 is used because smaller n is not reliably surjective over GF(2)^256
+   (rank can be 255).
+
+3. **Build the WAV** (mono 16-bit PCM, the session's exact rate) and base64 it:
+
+   ```python
+   def build_wav(samples, rate):
+       data = b''.join(struct.pack('<H', s & 0xffff) for s in samples)
+       return (b'RIFF' + struct.pack('<I', 36+len(data)) + b'WAVE'
+               + b'fmt ' + struct.pack('<IHHIIHH', 16,1,1,rate,rate*2,2,16)
+               + b'data' + struct.pack('<I', len(data)) + data)
+
+   def solve(nonce_hex, n=48):
+       nonce = bytes.fromhex(nonce_hex)
+       rate = RATES[nonce[0] % 6]
+       samples = solve_wav(nonce, rate, n)
+       return base64.b64encode(build_wav(samples, rate)).decode(), rate, samples
+   ```
+
+   n = 48 -> 140-byte WAV -> 188 base64 chars.
+
+4. **Talk to the remote** (TLS on `<deployment>.challs.ctf.thefewchosen.com:1337`).
+   The service runs the TUI in a PTY (canonical + echo). The seed line content is
+   ignored — the server generates a fresh random seed per connection — so read
+   `SESSION` and the rate from the rendered screen instead:
+
+   ```python
+   import socket, ssl, re, time
+   ctx = ssl.create_default_context()
+   ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+   s = socket.create_connection((host, 1337), timeout=20)
+   tls = ctx.wrap_socket(s, server_hostname=host)
+   tls.settimeout(0.5)
+
+   tls.sendall(b'000102030405060708090a0b0c0d0e0f\r')   # any 32-hex line + CR
+   buf = b''
+   deadline = time.time() + 12
+   while time.time() < deadline:
+       try:
+           d = tls.recv(65536)
+           if d: buf += d
+       except socket.timeout:
+           pass
+       if b'\x1b[?1049h' in buf: break          # TUI is up
+   text = buf.decode('latin1', 'replace')
+   session = re.search(r'([0-9a-f]{32})', text).group(1)   # SESSION
+   ```
+
+5. **Submit the WAV and read the flag.**
+
+   ```python
+   b64, rate, samples = solve(session, n=48)    # nonce = bytes.fromhex(SESSION)
+   tls.sendall(b64.encode())
+   time.sleep(0.4)
+   tls.sendall(b'\r')
+   # read ~10s, then match the flag in the raw stream
+   flag = re.search(r'TFCCTF\{[^}]+\}', buf.decode('latin1','replace')).group(0)
+   ```
+
+   The screen prints `PERFECT CADENCE - the track resonates`; the remote then
+   prints the flag.
+
+## Full chain
+
+```
+python3 solver.py            # import solve() from cadence_4b6fe26a/solver.py
+# 1. TLS connect to <deployment>.challs.ctf.thefewchosen.com:1337 (no verify, timeout 0.5)
+# 2. send any 32-hex line + CR; wait (~12s) for \x1b[?1049h
+# 3. regex SESSION ([0-9a-f]{32}) and the Hz rate from the screen
+# 4. b64,rate,samples = solve(SESSION, n=48)
+# 5. send b64, sleep 0.4, send CR, read ~10s
+# 6. regex TFCCTF{...}
+```
+
+## Flag
+
+`TFCCTF{the_encore_resonates_over_gf2_7c4e91ab}`
+
+## Lessons
+
+- If a challenge's "resonance/PRF" check only mixes samples with XOR, shifts,
+  and GF-multiply, treat it as a GF(2)-linear map and solve a linear system
+  instead of searching the audio space.
+- For a PTY-backed remote TUI, don't compute from your own seed: read the
+  session/nonce the server renders and solve for that.
+- A blocking socket with `settimeout` is more robust than non-blocking
+  `recv()` loops when the daemon echoes slowly — a first empty read is not a
+  dead pod.

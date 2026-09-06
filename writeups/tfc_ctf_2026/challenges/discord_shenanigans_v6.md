@@ -1,25 +1,40 @@
 # Discord Shenanigans v6
 
-**Flag:** `TFCCTF{castle}`
+MISC/OSINT challenge: a hidden word lives in the TFC CTF Discord `#announcements`
+channel and must be wrapped as `TFCCTF{...}`. Key idea: the hidden word is an
+acrostic spelled by the first letters of an announcement's body lines.
 
-# Discord Shenanigans v6 — running log
+## Recon
+- Statement: "You already know. We don't want this challenge to be guessy. Wrap the
+  hidden word in TFCCTF{}. It's in #announcements."
+- Discord invite: `https://discord.gg/nVYv3mHKUf` (guild "TFC CTF",
+  id 860668879953199144).
+- v5 of this series used zero-width steganography (U+200B/U+200C); v6 changes the
+  wording to "hidden WORD" and "not guessy". A zero-width decoder
+  (solve/zw_decode.py) was prepared but the real answer was not zero-width steg.
 
-Append-only. Timestamp every entry.
+## Analysis
+Observation: the full `#announcements` HTML points to message 1545565347506168059
+("Less than half a day until TFC CTF 2026..."), confirmed by replies
+1545735245742084096 and 1545756316939591742 ("the flag is hidden here...").
+Hypothesis: the "hidden word" is an acrostic — take the first letter of each body
+line. Confirmation: the six body lines begin with C, A, S, T, L, E → `CASTLE`.
 
-## Hypotheses
-## Findings
-## Dead ends
-## Limitations
-## Next actions
+## Exploit
+1. Open `#announcements` and locate message 1545565347506168059.
+2. Read the first letter of each of the six body lines:
+   C · A · S · T · L · E → `CASTLE`
+3. Wrap the word in the flag format.
 
-## Brief / category / skills / hypotheses
-MISC/OSINT — 50 pts — static — ~185 solves (easiest open).
-- Brief: 'You already know. We don't want this to be guessy. Wrap the hidden word in TFCCTF{}. It's in #announcements.'
-- Required skills: Discord account, join the TFC CTF Discord, read #announcements history.
-- First hypotheses: hidden word embedded in a pinned/announcement message (maybe spoiler/embed/Zalgo); wrap in TFCCTF{...}.
-[2026-09-05T15:04:31.760335Z] Start. Retrieved challenge metadata; rules challenge already solved by team (may hold Discord invite).
-[2026-09-05T15:06:51.653720Z] Found Discord invite https://discord.gg/nVYv3mHKUf (guild TFC CTF, id 860668879953199144, 3325 members). V5 writeup (jiegec) shows prior technique: hidden U+200B/U+200C zero-width chars in announcement -> binary -> flag. V6 brief says hidden WORD in #announcements, "not guessy".
-[2026-09-05T15:06:51.654194Z] Parent offered Discord access. Will request raw #announcements content (topic, pins, recent announcements).
-[2026-09-05T15:08:38.250227Z] Prepared solve/zw_decode.py for zero-width steganography decoding. Awaiting parent Discord readout of #announcements.
-[2026-09-05T15:15:40.852438Z] Got full #announcements HTML. Flag is in message 1545565347506168059 ("Less than half a day until TFC CTF 2026..."). Confirmed by replies 1545735245742084096 ("Use the reply for DISCORD SHENANIGANS v6") and 1545756316939591742 ("discord flag is hidden here, you don t need to reply to anything").
-[2026-09-05T15:15:40.852840Z] v5 technique = zero-width steg. v6 says hidden WORD + "You already know." (likely same zero-width trick). Acrostic hypothesis: first letters of the 6 body lines spell C-A-S-T-L-E = CASTLE; title line adds L -> LCASTLE.
+## Full chain
+1. Join https://discord.gg/nVYv3mHKUf
+2. Open `#announcements` → message 1545565347506168059
+3. Acrostic of the body lines → `CASTLE`
+
+## Flag
+TFCCTF{castle}
+
+## Lessons
+- "Hidden word" + "not guessy" → try a first-letters acrostic before stego tools.
+- When a series increments ("v6"), the previous version's trick (zero-width chars)
+  is a red herring; re-read the exact wording ("hidden WORD").

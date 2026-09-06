@@ -9,7 +9,7 @@ Team sudoaza. 24 solved / 5 unsolved. Consolidated from notes.md + SOLVED_SUMMAR
   - AGCD: SDA lattice (LLL) recovers p from x_i = p*q_i + r_i
 
 - **Ariadne's Tab** — `TFCCTF{0ne_r3d1rect_aw4y_fr0m_th3_tak30v3r}`
-  - open redirect chain in the web app to leak the bot session/flag
+  - adb-over-TCP root on the emulator -> read the ariadnetab SharedPreferences + Chrome leveldb -> API decrypt of the flag
 
 - **bitdebit³** — `TFCCTF{this_is_probably_getting_solved_by_AI_but_so_be_it_i_thought_it_was_cool}`
   - one-bit _IO_buf_end flip -> FILE overflow -> House of Apple 2 (wide vtable __doallocate=system)

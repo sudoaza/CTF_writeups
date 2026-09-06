@@ -30,7 +30,7 @@ Team: sudoaza. Backend https://api.ctf.thefewchosen.com. Creds in creds.json.
 | 22 | Ship Me | TFCCTF{parcelables_are_safer_not_safe} | self-a11y + relay to foreground + window read |
 
 | 23 | Vaultkeeper | TFC{04d4c11ea3641f2ec562b657ea6428b4} | CVE-2024-38473: %3F FilesMatch+Require-ip bypass -> SSRF -> cap_key -> forged cap -> SQLi -> unserialize RCE |
-| 24 | Ariadne's Tab | TFCCTF{0ne_r3d1rect_aw4y_fr0m_th3_tak30v3r} | open redirect chain to leak the bot session |
+| 24 | Ariadne's Tab | TFCCTF{0ne_r3d1rect_aw4y_fr0m_th3_tak30v3r} | adb-over-TCP root -> SharedPreferences/leveldb read -> API decrypt |
 
 ## Unsolved (7) — documented blockers
 - meshgate (0 solves): 3 secrets in unreachable app source.
