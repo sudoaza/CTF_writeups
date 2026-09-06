@@ -6,6 +6,9 @@ This is the full writeup folder for the TFC CTF 2026 ("thefewchosen") event.
 Every solved challenge has its flag, the technique, and the full running log;
 every unsolved challenge has the blocker and everything that was tried.
 
+![Solved](solved_tfc_ctf.png)
+![Leaderboard](leaderboard_tfc_ctf.png)
+
 ## Consolidated writeups
 
 - [All 29 challenges — flags, techniques, blockers](WRITEUPS.md)
