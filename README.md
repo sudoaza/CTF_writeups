@@ -1,3 +1,7 @@
+
+## TFC CTF 2026 (The Few Chosen)
+
+- [24/29 flags — full writeups](writeups/tfc_ctf_2026/README.md)
 # CTF_writeups
 
 ## Google CTF 2022
